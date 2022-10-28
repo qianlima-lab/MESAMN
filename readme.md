@@ -16,7 +16,7 @@ based action recognition tasks compared to existing models. Furthermore, the cap
 long-term dependencies of the MESAMN is verified empirically.
 
 <div align="center">
-<img src="/image/Model.png" width="70%">
+<img src="image/Model.png" width="70%">
 </div>
 
 ## Data
