@@ -1,0 +1,173 @@
+from __future__ import print_function
+from datetime import datetime
+
+import os
+import tensorflow as tf
+from keras.backend.tensorflow_backend import set_session
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+config = tf.ConfigProto()
+config.gpu_options.allow_growth = True
+set_session(tf.Session(config = config))
+
+import numpy as np
+import cPickle as cp
+
+from keras.models import Model
+from keras.layers import Input, Dense, Dropout, concatenate
+from keras.layers import Conv2D, GlobalMaxPooling2D
+
+import reservoir
+import utils
+
+def print_log(s):
+	with open('./UTD_fiter_discuss.txt', 'a') as f:
+		print(s, end="\n", file=f)
+
+print('Loading data...')	
+filepath_train = './US_UTD-MHAD_train_DataSet.p'
+filepath_test = './US_UTD-MHAD_test_DataSet.p'
+skeleton_train, labels_train = cp.load(open(filepath_train, 'rb'))
+skeleton_test, labels_test = cp.load(open(filepath_test, 'rb'))
+
+print('Transfering labels...')
+labels_train, labels_test, num_classes = utils.transfer_labels(labels_train, labels_test)
+
+num_samples_train, time_length, n_in = skeleton_train.shape
+num_samples_test = skeleton_test.shape[0]
+
+n_res = n_in * 3
+IS = 0.1
+SR = 0.5
+
+leakyrate = 1.0
+dilations = [1, 1, 1, 1]
+#dilations = [1, 1, 1, 1]   #convmesn(skip:1,2,4,8)
+num_channels = len(dilations)
+# sparsity = 0.5
+sparsity = [0.1+i*0.8/(num_channels-1) for i in range(num_channels)]
+sum_acc = 0
+# for hds in range(5):
+if not os.path.exists('./UTD_esn_states.npy'):
+	esns = [reservoir.reservoir_layer(n_in, n_res, IS, SR, sparsity[i], leakyrate) for i in range(num_channels)]
+	#esn = reservoir.reservoir_layer(n_in, n_res, IS, SR, sparsity, leakyrate)
+
+	echo_states_train = np.empty((num_samples_train, num_channels, time_length, n_res), np.float32)
+	echo_states_test = np.empty((num_samples_test, num_channels, time_length, n_res), np.float32)
+
+	print('Getting echo states...')
+	for i in range(num_channels):
+		#echo_states_train[:,i,:,:] = esn.get_echo_states(skeleton_train, dilations[i])
+		echo_states_train[:,i,:,:] = esns[i].get_echo_states(skeleton_train, dilations[i])
+		#echo_states_test[:,i,:,:] = esn.get_echo_states(skeleton_test, dilations[i])
+		echo_states_test[:,i,:,:] = esns[i].get_echo_states(skeleton_test, dilations[i])
+	cp.dump([echo_states_train, echo_states_test], open('./UTD_esn_states.npy', 'wb'))
+else:
+	echo_states_train, echo_states_test = np.load('./UTD_esn_states.npy')
+
+# input_shape = (1, time_length, n_res)
+input_shape = time_length * n_res
+
+for _ in range(5):
+	res = []
+	for time in [2]:
+		# nb_filter = num_classes * 2
+		nb_filter = num_classes * time
+		nb_row = [1, 2, 4, 8]
+		nb_col = n_res
+		kernel_initializer = 'lecun_uniform'
+		activation = 'relu'
+		padding = 'valid'
+		strides = (1, 1)
+		data_format = 'channels_first'
+
+		optimizer = 'adam'
+		loss = ['binary_crossentropy', 'categorical_crossentropy']
+
+		batch_size = 8
+		nb_epoch = 100
+		verbose = 1
+
+		#inputs = Input(shape = input_shape)
+		inputs = []
+		multi_pools = []
+		for i in range(num_channels):
+
+			input = Input(shape = (input_shape, ))
+			inputs.append(input)
+
+			# pools = []
+			# for j in range(3):
+			# 	conv = Conv2D(nb_filter, (nb_row[i] * (j+1), nb_col), kernel_initializer = kernel_initializer, activation = activation, padding = padding, strides = strides, data_format = data_format)(input)
+			# pool = GlobalMaxPooling2D(data_finputormat = data_format)(conv)
+			# print(input.shape)    ## (?, 1, 121, 180)
+			# print(input.shape[0])
+			# tf.reshape(input, [input.shape[0], 1, -1])
+			# print(input.shape)
+			# # print(tf.shape(input)[2])
+			# print(input.shape[2])
+
+			# # input = tf.reshape(input, [-1, tf.shape(input)[1]*tf.shape(input)[2]*tf.shape(input)[3]])
+			# # input = tf.reshape(input, [-1, input.shape[1] * input.shape[2] * input.shape[3]])
+			# print(input.shape)
+
+			# print(len(pools))
+			# print(pools[0].shape)
+
+			multi_pools.append(Dense(nb_filter, kernel_initializer = kernel_initializer, activation = activation)(input))
+
+		#features = Dense(nb_filter * num_channels / 2, kernel_initializer = kernel_initializer, activation = activation)(concatenate(multi_pools))
+		features = Dense(nb_filter, kernel_initializer = kernel_initializer, activation = activation)(concatenate(multi_pools))
+		print(features.shape)
+		#features = Dense(nb_filter, kernel_initializer = kernel_initializer, activation = activation)(multi_pools[0])
+		#features = Dropout(0.5)(features)
+
+		outputs = Dense(num_classes, kernel_initializer = kernel_initializer, activation = 'softmax')(features)
+		model = Model(inputs = inputs, outputs = outputs)
+		#model.summary()
+
+		model.compile(optimizer = optimizer, loss = loss[1], metrics = ['accuracy'])
+
+		_echo_states_train = [echo_states_train[:,i:i+1,:,:] for i in range(num_channels)]
+		_echo_states_test = [echo_states_test[:,i:i+1,:,:] for i in range(num_channels)]
+
+		## reshape before feed in the network layer.
+		
+		_echo_states_train = np.array(_echo_states_train)  ## 
+		_echo_states_test = np.array(_echo_states_test)
+
+		
+		
+		_echo_states_train = np.reshape(_echo_states_train, (_echo_states_train.shape[0], _echo_states_train.shape[1],  _echo_states_train.shape[-1] * _echo_states_train.shape[-2] * _echo_states_train.shape[-3]))
+		_echo_states_test = np.reshape(_echo_states_test, (_echo_states_test.shape[0], _echo_states_test.shape[1], _echo_states_test.shape[-1] * _echo_states_test.shape[-2] * _echo_states_test.shape[-3]))
+
+		_echo_states_train = [_echo_states_train[i,:,:] for i in range(num_channels)]  ## 
+		_echo_states_test = [_echo_states_test[i,:,:] for i in range(num_channels)]
+		# _echo_states_train.tolist()
+		# _echo_states_test.tolist()
+		# print(len(_echo_states_train), len(_echo_states_train[0]))
+		# print(len(_echo_states_test), len(_echo_states_test[0]))
+
+		history = model.fit(_echo_states_train, labels_train, batch_size = batch_size, epochs = nb_epoch, verbose = verbose, validation_data = (_echo_states_test, labels_test))
+
+
+
+		epoch = 0
+		count = 0
+		max_acc = 0
+		for acc in history.history['val_acc']:
+			count = count + 1
+			if acc > max_acc:
+				max_acc = acc
+				epoch = count
+		sum_acc = sum_acc + history.history['val_acc'][-1]
+	
+		print('Epoch :', epoch)
+		print('Max accuracy :', max_acc)
+		# print('Averege accuracy :', history.history['val_acc'][-1])
+		res.append([time, max_acc])
+	# average = sum_acc/5
+	# print("average:" + str(average))
+	# print(res)
+	print_log(res)
+
+	
